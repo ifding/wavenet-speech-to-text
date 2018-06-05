@@ -1,195 +1,260 @@
-# reference : https://github.com/Faur/TIMIT
-# 			  https://github.com/jameslyons/python_speech_features/issues/53
-import os
-import sys
-import wave
-import timeit; program_start_time = timeit.default_timer()
-import random; random.seed(int(timeit.default_timer()))
-from six.moves import cPickle 
 import numpy as np
-import scipy.io.wavfile as wav
+import pandas as pd
+import glob
+import csv
+import librosa
+import scikits.audiolab
+import data
+import os
+import subprocess
 
-import python_speech_features as features
-# a python package for speech features at https://github.com/jameslyons/python_speech_features
-
-if len(sys.argv) != 3:
-	print('Usage: python3 preprocess.py <timit directory> <output_file>')
-
-
-##### SCRIPT META VARIABLES #####
-phn_file_postfix = '.phn'
-RIFF_wav_postfix = '.WAV'
-
-##### Validation split #####
-# default using 5% of data as validation
-val_split 	= 0.05 
+__author__ = 'namju.kim@kakaobrain.com'
 
 
-data_type = 'float32'
-
-paths = sys.argv[1]
-train_source_path	= os.path.join(paths, 'train')
-test_source_path	= os.path.join(paths, 'test')
-target_path			= os.path.join(paths, sys.argv[2])
+# data path
+_data_path = "asset/data/"
 
 
-# 61 different phonemes
-phonemes = ["b", "bcl", "d", "dcl", "g", "gcl", "p", "pcl", "t", "tcl", "k", "kcl", "dx", "q", "jh", "ch", "s", "sh", "z", "zh", 
-	"f", "th", "v", "dh", "m", "n", "ng", "em", "en", "eng", "nx", "l", "r", "w", "y", 
-	"hh", "hv", "el", "iy", "ih", "eh", "ey", "ae", "aa", "aw", "ay", "ah", "ao", "oy",
-	"ow", "uh", "uw", "ux", "er", "ax", "ix", "axr", "ax-h", "pau", "epi", "h#"]
+#
+# process VCTK corpus
+#
 
-phonemes2index = {k:v for v,k in enumerate(phonemes)}
+def process_vctk(csv_file):
 
+    # create csv writer
+    writer = csv.writer(csv_file, delimiter=',')
 
-def get_total_duration(file):
-	"""Get the length of the phoneme file, i.e. the 'time stamp' of the last phoneme"""
-	for line in reversed(list(open(file))):
-		[_, val, _] = line.split()
-		return int(val)
+    # read label-info
+    df = pd.read_table(_data_path + 'VCTK-Corpus/speaker-info.txt', usecols=['ID'],
+                       index_col=False, delim_whitespace=True)
 
+    # read file IDs
+    file_ids = []
+    for d in [_data_path + 'VCTK-Corpus/txt/p%d/' % uid for uid in df.ID.values]:
+        file_ids.extend([f[-12:-4] for f in sorted(glob.glob(d + '*.txt'))])
 
-def create_mfcc(filename):
-	"""Perform standard preprocessing, as described by Alex Graves (2012)
-	http://www.cs.toronto.edu/~graves/preprint.pdf
-	Output consists of 12 MFCC and 1 energy, as well as the first derivative of these.
-	[1 energy, 12 MFCC, 1 diff(energy), 12 diff(MFCC)
-	"""
+    for i, f in enumerate(file_ids):
 
-	(rate,sample) = wav.read(filename)
+        # wave file name
+        wave_file = _data_path + 'VCTK-Corpus/wav48/%s/' % f[:4] + f + '.wav'
+        fn = wave_file.split('/')[-1]
+        target_filename = 'asset/data/preprocess/mfcc/' + fn + '.npy'
+        if os.path.exists( target_filename ):
+            continue
+        # print info
+        print("VCTK corpus preprocessing (%d / %d) - '%s']" % (i, len(file_ids), wave_file))
 
-	mfcc = features.mfcc(sample, rate, winlen=0.025, winstep=0.01, numcep = 13, nfilt=26,
-	preemph=0.97, appendEnergy=True)
-	d_mfcc = features.delta(mfcc, 2)
-	a_mfcc = features.delta(d_mfcc, 2)
+        # load wave file
+        wave, sr = librosa.load(wave_file, mono=True, sr=None)
 
-	out = np.concatenate([mfcc, d_mfcc, a_mfcc], axis=1)
+        # re-sample ( 48K -> 16K )
+        wave = wave[::3]
 
-	return out, out.shape[0]
+        # get mfcc feature
+        mfcc = librosa.feature.mfcc(wave, sr=16000)
 
-def calc_norm_param(X):
-	"""Assumes X to be a list of arrays (of differing sizes)"""
-	total_len = 0
-	mean_val = np.zeros(X[0].shape[1])
-	std_val = np.zeros(X[0].shape[1])
-	for obs in X:
-		obs_len = obs.shape[0]
-		mean_val += np.mean(obs,axis=0)*obs_len
-		std_val += np.std(obs, axis=0)*obs_len
-		total_len += obs_len
-	
-	mean_val /= total_len
-	std_val /= total_len
+        # get label index
+        label = data.str2index(open(_data_path + 'VCTK-Corpus/txt/%s/' % f[:4] + f + '.txt').read())
 
-	return mean_val, std_val, total_len
-
-def normalize(X, mean_val, std_val):
-	for i in range(len(X)):
-		X[i] = (X[i] - mean_val)/std_val
-	return X
-
-def set_type(X, type):
-	for i in range(len(X)):
-		X[i] = X[i].astype(type)
-	return X
+        # save result ( exclude small mfcc data to prevent ctc loss )
+        if len(label) < mfcc.shape[1]:
+            # save meta info
+            writer.writerow([fn] + label)
+            # save mfcc
+            np.save(target_filename, mfcc, allow_pickle=False)
 
 
-def preprocess_dataset(source_path):
-	"""Preprocess data, ignoring compressed files and files starting with 'SA'"""
-	i = 0
-	X = []
-	Y = []
+#
+# process LibriSpeech corpus
+#
 
-	for dirName, subdirList, fileList in os.walk(source_path):
-		for fname in fileList:
-			if not fname.endswith(phn_file_postfix):
-				continue
+def process_libri(csv_file, category):
 
-			phn_fname = dirName + '/' + fname
-			wav_fname = dirName + '/' + fname[0:-4] + RIFF_wav_postfix
+    parent_path = _data_path + 'LibriSpeech/' + category + '/'
+    labels, wave_files = [], []
 
-			total_duration = get_total_duration(phn_fname)
-			fr = open(phn_fname)
+    # create csv writer
+    writer = csv.writer(csv_file, delimiter=',')
 
-			X_val, total_frames = create_mfcc(wav_fname)
-			total_frames = int(total_frames)
+    # read directory list by speaker
+    speaker_list = glob.glob(parent_path + '*')
+    for spk in speaker_list:
 
-			X.append(X_val)
+        # read directory list by chapter
+        chapter_list = glob.glob(spk + '/*/')
+        for chap in chapter_list:
 
-			y_val = np.zeros(total_frames) - 1
-			start_ind = 0
-			for line in fr:
-				[start_time, end_time, phoneme] = line.rstrip('\n').split()
-				start_time = int(start_time)
-				end_time = int(end_time)
+            # read label text file list
+            txt_list = glob.glob(chap + '/*.txt')
+            for txt in txt_list:
+                with open(txt, 'rt') as f:
+                    records = f.readlines()
+                    for record in records:
+                        # parsing record
+                        field = record.split('-')  # split by '-'
+                        speaker = field[0]
+                        chapter = field[1]
+                        field = field[2].split()  # split field[2] by ' '
+                        utterance = field[0]  # first column is utterance id
 
-				phoneme_num = phonemes2index[phoneme] if phoneme in phonemes2index else -1
-				end_ind = int(np.round((end_time)/total_duration*total_frames))
-				y_val[start_ind:end_ind] = phoneme_num
+                        # wave file name
+                        wave_file = parent_path + '%s/%s/%s-%s-%s.flac' % \
+                                                  (speaker, chapter, speaker, chapter, utterance)
+                        wave_files.append(wave_file)
 
-				start_ind = end_ind
-			fr.close()
+                        # label index
+                        labels.append(data.str2index(' '.join(field[1:])))  # last column is text label
 
-			if -1 in y_val:
-				print('WARNING: -1 detected in TARGET')
-				print(y_val)
+    # save results
+    for i, (wave_file, label) in enumerate(zip(wave_files, labels)):
+        fn = wave_file.split('/')[-1]
+        target_filename = 'asset/data/preprocess/mfcc/' + fn + '.npy'
+        if os.path.exists( target_filename ):
+            continue
+        # print info
+        print("LibriSpeech corpus preprocessing (%d / %d) - '%s']" % (i, len(wave_files), wave_file))
 
-			Y.append(y_val.astype('int32'))
+        # load flac file
+        wave, sr, _ = scikits.audiolab.flacread(wave_file)
 
-			i+=1
-			print('file No.',i, end='\r', flush=True)
+        # get mfcc feature
+        mfcc = librosa.feature.mfcc(wave, sr=16000)
 
-	print('Done')
-	return X, Y
+        # save result ( exclude small mfcc data to prevent ctc loss )
+        if len(label) < mfcc.shape[1]:
+            # filename
+
+            # save meta info
+            writer.writerow([fn] + label)
+
+            # save mfcc
+            np.save(target_filename, mfcc, allow_pickle=False)
 
 
-##### PREPROCESSING #####
-print()
+#
+# process TEDLIUM corpus
+#
+def convert_sph( sph, wav ):
+    """Convert an sph file into wav format for further processing"""
+    command = [
+        'sox','-t','sph', sph, '-b','16','-t','wav', wav
+    ]
+    subprocess.check_call( command ) # Did you install sox (apt-get install sox)
 
-print('Preprocessing training data...')
-X_train_all, y_train_all = preprocess_dataset(train_source_path)
-print('Preprocessing testing data...')
-X_test, y_test = preprocess_dataset(test_source_path)
-print('Preprocessing completed.')
+def process_ted(csv_file, category):
 
-print()
-train_size 	= len(X_train_all)
-print('Collected {} training instances from {} (should be 4620 in complete TIMIT )'.format(train_size,train_source_path))
-print('Collected {} testing instances from {} (should be 1680 in complete TIMIT )'.format(len(X_test),test_source_path))
+    parent_path = _data_path + 'TEDLIUM_release2/' + category + '/'
+    labels, wave_files, offsets, durs = [], [], [], []
 
-print('Spliting {} out of {} ({}%) training data as validation set.'.format(int(train_size*val_split),train_size,val_split*100))
-val_idx = [int(i) for i in random.sample(range(0, train_size), int(train_size*val_split))]
+    # create csv writer
+    writer = csv.writer(csv_file, delimiter=',')
 
-X_train = []; X_val = []
-y_train = []; y_val = []
-for i in range(len(X_train_all)):
-    if i in val_idx:
-        X_val.append(X_train_all[i])
-        y_val.append(y_train_all[i])
-    else:
-        X_train.append(X_train_all[i])
-        y_train.append(y_train_all[i])
+    # read STM file list
+    stm_list = glob.glob(parent_path + 'stm/*')
+    for stm in stm_list:
+        with open(stm, 'rt') as f:
+            records = f.readlines()
+            for record in records:
+                field = record.split()
 
-print()
-print('Normalizing data to let mean=0, sd=1 for each channel.')
+                # wave file name
+                wave_file = parent_path + 'sph/%s.sph.wav' % field[0]
+                wave_files.append(wave_file)
 
-mean_val, std_val, _ = calc_norm_param(X_train)
+                # label index
+                labels.append(data.str2index(' '.join(field[6:])))
 
-X_train = normalize(X_train, mean_val, std_val)
-X_val 	= normalize(X_val, mean_val, std_val)
-X_test 	= normalize(X_test, mean_val, std_val)
+                # start, end info
+                start, end = float(field[3]), float(field[4])
+                offsets.append(start)
+                durs.append(end - start)
 
-X_train = set_type(X_train, data_type)
-X_val 	= set_type(X_val, data_type)
-X_test 	= set_type(X_test, data_type)
+    # save results
+    for i, (wave_file, label, offset, dur) in enumerate(zip(wave_files, labels, offsets, durs)):
+        fn = "%s-%.2f" % (wave_file.split('/')[-1], offset)
+        target_filename = 'asset/data/preprocess/mfcc/' + fn + '.npy'
+        if os.path.exists( target_filename ):
+            continue
+        # print info
+        print("TEDLIUM corpus preprocessing (%d / %d) - '%s-%.2f]" % (i, len(wave_files), wave_file, offset))
+        # load wave file
+        if not os.path.exists( wave_file ):
+            sph_file = wave_file.rsplit('.',1)[0]
+            if os.path.exists( sph_file ):
+                convert_sph( sph_file, wave_file )
+            else:
+                raise RuntimeError("Missing sph file from TedLium corpus at %s"%(sph_file))
+        wave, sr = librosa.load(wave_file, mono=True, sr=None, offset=offset, duration=dur)
 
-print()
-print('Saving data to ',target_path)
-with open(target_path + '.pkl', 'wb') as cPickle_file:
-    cPickle.dump(
-        [X_train, y_train, X_val, y_val, X_test, y_test], 
-        cPickle_file, 
-        protocol=cPickle.HIGHEST_PROTOCOL)
+        # get mfcc feature
+        mfcc = librosa.feature.mfcc(wave, sr=16000)
 
-print()
-print('Preprocessing completed in {:.3f} secs.'.format(timeit.default_timer() - program_start_time))
+        # save result ( exclude small mfcc data to prevent ctc loss )
+        if len(label) < mfcc.shape[1]:
+            # filename
+
+            # save meta info
+            writer.writerow([fn] + label)
+
+            # save mfcc
+            np.save(target_filename, mfcc, allow_pickle=False)
+
+
+#
+# Create directories
+#
+if not os.path.exists('asset/data/preprocess'):
+    os.makedirs('asset/data/preprocess')
+if not os.path.exists('asset/data/preprocess/meta'):
+    os.makedirs('asset/data/preprocess/meta')
+if not os.path.exists('asset/data/preprocess/mfcc'):
+    os.makedirs('asset/data/preprocess/mfcc')
+
+
+#
+# Run pre-processing for training
+#
+
+# VCTK corpus
+csv_f = open('asset/data/preprocess/meta/train.csv', 'w')
+process_vctk(csv_f)
+csv_f.close()
+
+# LibriSpeech corpus for train
+csv_f = open('asset/data/preprocess/meta/train.csv', 'a+')
+process_libri(csv_f, 'train-clean-360')
+csv_f.close()
+
+# TEDLIUM corpus for train
+csv_f = open('asset/data/preprocess/meta/train.csv', 'a+')
+process_ted(csv_f, 'train')
+csv_f.close()
+
+#
+# Run pre-processing for validation
+#
+
+# LibriSpeech corpus for valid
+csv_f = open('asset/data/preprocess/meta/valid.csv', 'w')
+process_libri(csv_f, 'dev-clean')
+csv_f.close()
+
+# TEDLIUM corpus for valid
+csv_f = open('asset/data/preprocess/meta/valid.csv', 'a+')
+process_ted(csv_f, 'dev')
+csv_f.close()
+
+#
+# Run pre-processing for testing
+#
+
+# LibriSpeech corpus for test
+csv_f = open('asset/data/preprocess/meta/test.csv', 'w')
+process_libri(csv_f, 'test-clean')
+csv_f.close()
+
+# TEDLIUM corpus for test
+csv_f = open('asset/data/preprocess/meta/test.csv', 'a+')
+process_ted(csv_f, 'test')
+csv_f.close()
+
